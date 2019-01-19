@@ -9,26 +9,24 @@ import torch.backends.cudnn as cudnn
 import torch.optim
 import torch.utils.data
 import torchvision.transforms as transforms
+from tensorboardX import SummaryWriter
 
 import models
-from lib.cla import AverageMeter, accuracy, ThreatScore
+from library.common import AverageMeter, accuracy, ThreatScore
 from dataloader import ImageFolder_cla
-from hyper_parameter import hp
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 THRESHOLD = 0.5
 
-def main():
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    best_precision = 0
-    best_loss = 10
+def trainer(hp):
+    best_score = 0
     torch.manual_seed(30)
 
     root = os.path.join("ROOT_PATH", "MODEL_DIR")
     file_name = os.path.join(root, "checkpoint.pth.tar")
     best_model_file = os.path.join(root, "best_model.pth.tar")
-    best_score_file = os.path.join(root, "best_score.pth.tar")
     log_file = os.path.join(root, "log.txt")
+    writer = SummaryWriter(f"{root}/runs")
 
     # define loss function (criterion) and optimizer
     model = models.se_resnet18(num_classes=2).to(device)
@@ -43,8 +41,6 @@ def main():
         if os.path.isfile(hp["resume"]):
             print("=> loading checkpoint '{}'".format(hp["resume"]))
             checkpoint = torch.load(hp["resume"])
-            best_loss = checkpoint['best_loss']
-            best_precision = checkpoint["precision"]
             model.load_state_dict(checkpoint['state_dict'])
             optimizer.load_state_dict(checkpoint['optimizer'])
             scheduler.load_state_dict(checkpoint["scheduler"])
@@ -64,6 +60,7 @@ def main():
                 transforms.ColorJitter(),
                 transforms.ToTensor()
             ]),
+            mode="train",
         ),
         batch_size=hp["batch_size"], shuffle=True,
         num_workers=hp["workers"], pin_memory=False, drop_last=True)
@@ -74,6 +71,7 @@ def main():
             transform=transforms.Compose([
                 transforms.ToTensor(),
             ]),
+            mode="val",
         ),
         batch_size=hp["batch_size"], shuffle=False,
         num_workers=hp["workers"], pin_memory=False, drop_last=False)
@@ -90,46 +88,38 @@ def main():
                                                              optimizer.param_groups[0]["lr"]))
 
         # train for one epoch
-        loss, acc, precision, recall, prec = train(train_loader, model, criterion, optimizer, epoch)
-        v_loss, v_acc, v_precision, v_recall, v_prec = validate(val_loader, model, criterion, epoch)
-
-        print("Train Loss: {0:.4f}\tTrain Accuracy: {1:.4f}\tPrecision: {2:.4f}\tRecall: {3:.4f}\tfp_tn: {prec.fp_tn:.4f}\n"
-              "Val   Loss: {4:.4f}\tVal   Accuracy: {5:.4f}\tPrecision: {6:.4f}\tRecall: {7:.4f}\tfp_tn: {v_prec.fp_tn:.4f}\tTime: {8:.1f}\n"
-              "TP: {prec.tp}\tFP: {prec.fp}\tFN: {prec.fn}\tTF :{prec.tn}".format(
-             loss, acc, precision, recall, v_loss, v_acc, v_precision, v_recall, time.time()-start,
-            prec=prec, v_prec=v_prec))
+        loss, acc, precision, recall, prec = train(train_loader, model, criterion, optimizer, epoch, hp)
+        v_loss, v_acc, v_precision, v_recall, v_prec = validate(val_loader, model, criterion, epoch, hp)
 
         # remember best prec@1 and save checkpoint
+        writer.add_scalar(f"data/cv_{fold}_train_loss", loss, epoch)
+        writer.add_scalar(f"data/cv_{fold}_val_loss", v_loss, epoch)
+        writer.add_scalar(f"data/cv_{fold}_train_accuracy", acc, epoch)
+        writer.add_scalar(f"data/cv_{fold}_val_accuracy", v_acc, epoch)
+        log = f"Train Loss: {loss:.4f}\tAccuracy: {acc:.4f}\n" \
+              f"Val   Loss: {v_loss:.4f}\tAccuracy: {v_acc:.4f}\n"
+        print(log)
         with open(log_file, "a") as f:
-            f.write("--------epoch {0}---------".format(epoch) + "\n")
-            f.write("Train Loss: {0:.4f}\tTrain Accuracy: {1:.4f}\tPrecision: {2:.4f}\tRecall: {3:.4f}\tfp_tn: {prec.fp_tn:.4f}\n"
-                    "Val   Loss: {4:.4f}\tVal   Accuracy: {5:.4f}\tPrecision: {6:.4f}\tRecall: {7:.4f}\tfp_tn: {v_prec.fp_tn:.4f}\tTime: {8:.1f}\n"
-                    "TP: {prec.tp}\tFP: {prec.fp}\tFN: {prec.fn}\tTF :{prec.tn}".format(
-                    loss, acc, precision, recall, v_loss, v_acc, v_precision, v_recall, time.time()-start,
-                    prec=prec, v_prec=v_prec))
+            log = f"-----Epoch[{fold}:{epoch}] LR {optimizer.param_groups[0]['lr']}-----\n" + log
+            f.write(log)
 
-
-        is_best = v_loss < best_loss
-        is_best_score = v_acc > best_score_2
-        if is_best:
-            best_score = v_acc
-        best_loss = min(v_loss, best_loss)
-        best_score_2 = max(v_acc, best_score_2)
-        best_precision = max(v_precision, best_precision)
-        save_checkpoint({
-            'epoch': epoch + 1,
-            'state_dict': model.state_dict(),
-            'best_loss': v_loss,
-            'optimizer': optimizer.state_dict(),
-            'best_score': accuracy,
-            "scheduler": scheduler.state_dict(),
-        }, is_best, is_best_score,
+        is_best = v_acc > best_score
+        best_score = max(v_acc, best_score)
+        save_checkpoint(
+            {
+                'epoch': epoch + 1,
+                'state_dict': model.state_dict(),
+                'best_loss': v_loss,
+                'optimizer': optimizer.state_dict(),
+                'best_score': v_acc,
+                "scheduler": scheduler.state_dict(),
+            },
+            is_best,
             filename=file_name,
-            best_filename=best_model_file,
-            best_filename_score=best_score_file)
+            best_filename=best_model_file)
 
 
-def train(train_loader, model, criterion, optimizer, epoch):
+def train(train_loader, model, criterion, optimizer, epoch, hp):
     batch_time = AverageMeter()
     data_time = AverageMeter()
     losses = AverageMeter()
@@ -145,6 +135,7 @@ def train(train_loader, model, criterion, optimizer, epoch):
         data_time.update(time.time() - end)
 
         ### if input channel is Gray Scale => conccatenate to 3 channels
+        """
         mean = [0.485, 0.456, 0.406]
         std = [0.229, 0.224, 0.225]
         input = torch.cat([
@@ -152,6 +143,7 @@ def train(train_loader, model, criterion, optimizer, epoch):
             (input - mean[1]) / std[1],
             (input - mean[0]) / std[0],
         ], 1)
+        """
 
         input = input.to(device)
         target = target.to(device)
@@ -193,7 +185,7 @@ def train(train_loader, model, criterion, optimizer, epoch):
     return losses.avg, top1.avg, prec.precision, prec.recall, prec
 
 
-def validate(val_loader, model, criterion, epoch):
+def validate(val_loader, model, criterion, epoch, hp):
     losses = AverageMeter()
     top1 = AverageMeter()
     prec = ThreatScore()
@@ -205,6 +197,7 @@ def validate(val_loader, model, criterion, epoch):
         for i, (input, target) in enumerate(val_loader):
 
             ### if input channel is Gray Scale => conccatenate to 3 channels
+            """
             mean = [0.485, 0.456, 0.406]
             std = [0.229, 0.224, 0.225]
             input = torch.cat([
@@ -212,6 +205,7 @@ def validate(val_loader, model, criterion, epoch):
                 (input - mean[1]) / std[1],
                 (input - mean[0]) / std[0],
             ], 1)
+            """
 
             input = input.to(device)
             target = target.to(device)
@@ -260,4 +254,5 @@ def save_checkpoint(state, is_best, is_best_score, filename, best_filename, best
         shutil.copyfile(filename, best_filename_score)
 
 if __name__ == "__main__":
-    main()
+    from hyper_parameter import hp
+    trainer(hp)

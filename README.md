@@ -1,2 +1,2 @@
-# pytorch_image
+# pytorch image classification
 CNN models pipeline
